@@ -1,0 +1,100 @@
+diff --git a/drivers/gpu/ion/ion_system_heap.c b/drivers/gpu/ion/ion_system_heap.c
+index 96565bb..27b8e47 100644
+--- a/drivers/gpu/ion/ion_system_heap.c
++++ b/drivers/gpu/ion/ion_system_heap.c
+@@ -26,7 +26,13 @@
+ #include <linux/vmalloc.h>
+ #include <linux/list_sort.h>
+ #include "ion_priv.h"
++#ifdef CONFIG_SHRINK_MEMORY
++#include <linux/swap.h>
++#endif
+ 
++#ifdef CONFIG_SHRINK_MEMORY
++static struct work_struct shrink_memory_work;
++#endif
+ static unsigned int high_order_gfp_flags = (GFP_HIGHUSER | __GFP_ZERO |
+ 					    __GFP_NOWARN | __GFP_NORETRY |
+ 					    __GFP_NOMEMALLOC | __GFP_NO_KSWAPD) &
+@@ -155,6 +161,18 @@ static struct page_info *alloc_deferred_page(struct ion_system_heap *heap,
+ 	return found;
+ }
+ 
++#ifdef CONFIG_SHRINK_MEMORY
++static void shrink_memory_handler(struct work_struct *work)
++{
++	unsigned long int nr_pages = 0;
++	int i;
++	for (i=0; i<5; i++) {
++		nr_pages += shrink_all_memory(totalram_pages);
++	}
++	pr_info("[shrink_memory_handler]: Total pages freed: %lu\n", nr_pages);
++}
++#endif
++
+ static struct page_info *alloc_largest_available(struct ion_system_heap *heap,
+ 						 struct ion_buffer *buffer,
+ 						 unsigned long size,
+@@ -178,8 +196,12 @@ static struct page_info *alloc_largest_available(struct ion_system_heap *heap,
+ 						   orders[i]);
+ 		if (!info) {
+ 			page = alloc_buffer_page(heap, buffer, orders[i]);
+-			if (!page)
++			if (!page) {
++				if (IS_ENABLED(CONFIG_SHRINK_MEMORY) && (orders[i] == 4)) {
++					schedule_work(&shrink_memory_work);
++				}
+ 				continue;
++			}
+ 
+ 			info = kmalloc(sizeof(struct page_info), GFP_KERNEL);
+ 			/*
+@@ -542,6 +564,8 @@ struct ion_heap *ion_system_heap_create(struct ion_platform_heap *unused)
+ 	heap->heap.shrinker.batch = 0;
+ 	register_shrinker(&heap->heap.shrinker);
+ 	heap->heap.debug_show = ion_system_heap_debug_show;
++	if (IS_ENABLED(CONFIG_SHRINK_MEMORY))
++		INIT_WORK(&shrink_memory_work, shrink_memory_handler);
+ 	return &heap->heap;
+ err_create_pool:
+ 	for (i = 0; i < num_orders; i++)
+diff --git a/kernel/power/suspend.c b/kernel/power/suspend.c
+index 6b8171c..7f97e7a 100755
+--- a/kernel/power/suspend.c
++++ b/kernel/power/suspend.c
+@@ -27,6 +27,9 @@
+ #include <linux/ftrace.h>
+ #include <linux/rtc.h>
+ #include <trace/events/power.h>
++#ifdef CONFIG_SHRINK_MEMORY
++#include <linux/swap.h>
++#endif
+ 
+ #if defined (CONFIG_SEC_GPIO_DVS)
+ #include <linux/secgpio_dvs.h>
+@@ -125,6 +128,8 @@ static int suspend_test(int level)
+ static int suspend_prepare(void)
+ {
+ 	int error;
++	int i;
++	unsigned long nr_pages = 0;
+ 
+ 	if (!suspend_ops || !suspend_ops->enter)
+ 		return -EPERM;
+@@ -138,8 +143,15 @@ static int suspend_prepare(void)
+ 		goto Finish;
+ 
+ 	error = suspend_freeze_processes();
+-	if (!error)
++	if (!error) {
++#if 0
++	for (i=0; i<5; i++) {
++		nr_pages += shrink_all_memory(totalram_pages);
++	}
++	pr_info("[suspend_prepare]: Total pages freed: %lu\n", nr_pages);
++#endif
+ 		return 0;
++	}
+ 
+ 	suspend_stats.failed_freeze++;
+ 	dpm_save_failed_step(SUSPEND_FREEZE);

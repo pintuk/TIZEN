@@ -1,0 +1,161 @@
+--- linux-2.6.32/mm/vmstat.c	2011-11-19 20:01:34.881285718 +0530
++++ /root/PINTU_UBUNTU/SISO_WORK/LINUX_MM/FRAGMENTATION_DEMO/26-SEPT-2011/Kernel32/Track_HighOrder_Kernel/linux-2.6.32/mm/vmstat.c	2011-09-18 23:54:12.710736553 +0530
+@@ -601,6 +601,150 @@ static const struct file_operations page
+ 	.release	= seq_release,
+ };
+ 
++
++//Added Pintu : 14/June/2011 for measuring fragmentation level
++//********************************************************************************
++
++/* The purpose of this API is to measure the fragmentation level under each zones and for each order.
++ * We use the following formula to find the fragmentation percentage.
++ * fragmentation percentage(level) = (TotalFreePages - SUM[(2^i)*n])*100
++ *                                   -----------------------------------
++ *                                            TotalFreePages
++ * Where i is from order 1 to MAX_ORDER-1
++ * n = number of free pages in that order
++ * SUM implies sum over all the orders
++
++ * zone => represents the memory zone info
++ * totalfreepages => represents the total number of free physical pages available in the system at this point of time
++ * order => represents the page order
++ * RETURN Value = the rounding off fragmentation level in percentage across each order
++*/
++int measure_fragmentation_level(struct zone *zone, int order)
++{
++	unsigned long totalfreepages = 0;
++        unsigned long nr_freepages = 0; /* number of free pages in each order*/
++        unsigned long highorderpages = 0; /* number of free pages from the desired order value */
++        int level = 0; /* percentage fragmentation level */
++        int o = 0;
++
++	if(zone == NULL) return 0;
++
++	totalfreepages = zone_page_state(zone, NR_FREE_PAGES);
++	if(totalfreepages <= 0) {
++		return(0);
++	}
++	nr_freepages = 0;
++        for(o=order; o<MAX_ORDER; o++) {
++                nr_freepages = zone->free_area[o].nr_free;
++                highorderpages += (1 << o)*nr_freepages;
++        }
++        level = ((totalfreepages - highorderpages)*100)/totalfreepages;
++	if(level <=0 || level > 100)
++		level = 0;
++
++        return level;
++}
++EXPORT_SYMBOL(measure_fragmentation_level);
++
++/* The purpose of this API is to calculate total number of pages in each migrate type in each zone
++ * based on the order.
++ * zone => represents the memory zone info
++ * order => represents the page order
++ * mtype => represents the migrate type pages
++ * RETURN Value = number of migrate type pages under each order 
++*/
++static unsigned long get_migratetype_pages(struct zone *zone, int order, int mtype)
++{
++        unsigned long nr_migratepages = 0;
++        struct list_head *curr = NULL;
++
++	if(zone == NULL) return 0;
++
++        list_for_each(curr,&zone->free_area[order].free_list[mtype]) {
++                nr_migratepages++;
++        }
++        return nr_migratepages;
++}
++
++/*
++ * This is a callback function which is called the fraglevelinfo_show.
++ * The purpose of this function is to show print the fragmentation statistics across each zone 
++ * INPUT = /proc/fraglevelinfo file, page data, zone info
++ * RETURN : NONE
++*/
++
++static void fraglevelinfo_show_print(struct seq_file *m, pg_data_t *pgdat, struct zone *zone)
++{
++        int order = 0;
++        unsigned long totalfreepages = 0;
++        unsigned long totalmovablepages = 0;
++        unsigned long totalreclaimablepages = 0;
++        unsigned long freepages = 0;
++        unsigned long movablepages = 0;
++        unsigned long reclaimablepages = 0;
++        unsigned int fraglevel = 0;
++	unsigned int avglevel = 0;
++
++        /* Getting total free pages in each zone using the direct API */
++        /* This should give the total free pages correctly as per current state of buddyinfo */
++        /* Otherwise we need to calculate totalfreepages manually using the buddyinfo as follows */
++        /*
++         * for (order = 0; order < MAX_ORDER; order++) {
++         *      totalfreepages += (1 << order)*freepages;
++         * }
++        */
++        totalfreepages = zone_page_state(zone, NR_FREE_PAGES);
++        seq_printf(m, "Node:%d, Zone:%s\n", pgdat->node_id, zone->name);
++        seq_printf(m, "Order\t FreePages\t MovablePages\t ReclaimablePages\t Fragmentation[%%] \n");
++        for (order = 0; order < MAX_ORDER; order++) {
++                freepages = zone->free_area[order].nr_free;
++                fraglevel = measure_fragmentation_level(zone,order);
++		avglevel = avglevel + fraglevel;
++                movablepages = get_migratetype_pages(zone,order,MIGRATE_MOVABLE);
++                totalmovablepages += (1 << order)*movablepages;
++                reclaimablepages = get_migratetype_pages(zone,order,MIGRATE_RECLAIMABLE);
++                totalreclaimablepages += (1 << order)*reclaimablepages;
++                seq_printf(m, "%3d %10lu %16lu %17lu %25d%%\n",order,freepages,movablepages,reclaimablepages,fraglevel);
++        }
++        seq_printf(m, "TotalFreePages: %lu\n",totalfreepages);
++        seq_printf(m, "TotalMovablePages: %lu\n",totalmovablepages);
++        seq_printf(m, "TotalReclaimablePages: %lu\n",totalreclaimablepages);
++        seq_printf(m, "Overall Fragmentation: %d%%\n",(avglevel/MAX_ORDER));
++
++        seq_putc(m, '\n');
++
++}
++
++static int fraglevelinfo_show(struct seq_file *m, void *arg)
++{
++        pg_data_t *pgdat = (pg_data_t *)arg;
++        walk_zones_in_node(m, pgdat, fraglevelinfo_show_print);
++
++        return 0;
++}
++
++static const struct seq_operations fraglevelinfo_op = {
++        .start  = frag_start,
++        .next   = frag_next,
++        .stop   = frag_stop,
++        .show   = fraglevelinfo_show,
++};
++
++
++static int fraglevelinfo_open(struct inode *inode, struct file *file)
++{
++        return seq_open(file, &fraglevelinfo_op);
++}
++
++static const struct file_operations fraglevelinfo_file_operations = {
++        .open           = fraglevelinfo_open,
++        .read           = seq_read,
++        .llseek         = seq_lseek,
++        .release        = seq_release,
++};
++//********************************************************************************
++
++
+ #ifdef CONFIG_ZONE_DMA
+ #define TEXT_FOR_DMA(xx) xx "_dma",
+ #else
+@@ -944,6 +1088,7 @@ static int __init setup_vmstat(void)
+ 	proc_create("pagetypeinfo", S_IRUGO, NULL, &pagetypeinfo_file_ops);
+ 	proc_create("vmstat", S_IRUGO, NULL, &proc_vmstat_file_operations);
+ 	proc_create("zoneinfo", S_IRUGO, NULL, &proc_zoneinfo_file_operations);
++	proc_create("fraglevelinfo", S_IRUGO, NULL, &fraglevelinfo_file_operations);
+ #endif
+ 	return 0;
+ }

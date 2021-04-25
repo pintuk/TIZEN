@@ -1,0 +1,161 @@
+From 6f7d482821b7bd8031642f0338666d8a79670eb9 Mon Sep 17 00:00:00 2001
+From: Pintu Kumar <pintu.k@samsung.com>
+Date: Thu, 6 Apr 2017 10:56:03 +0530
+Subject: [PATCH] PrideLTE: mm: memcontrol: move shrink memory to bottom half
+
+During cgroup force_reclaim, when reclaim memory is not enough we call
+shrink memory. But sometimes it is observed that shrink memory may take
+longer time to reclaim pages.
+Thus in this patch we introduce moving shrink memory to bottom half using
+work queue handler.
+This will help force_reclaim to return quickly to user space to take
+further action.
+It will definitely improve the performance during force reclaim mode.
+
+[Model] Z400F
+[BinType] AP
+[Customer] N/A
+[Issue#] N/A
+[Request] N/A
+[Occurrence Version] N/A
+[Problem] Sometimes device shows sluggish behavior when apps are moved
+          to background using HOME key press.
+[Cause & Measure] Improve performance of force reclaim by moving shrink
+                  memory to bottom half processing.
+[Checking Method] Verified using sluggish test utility
+[Team] SRIB Kernel/BSP
+[Developer] Pintu Kumar
+[Solution company] Samsung
+[Change Type] N/A
+
+Change-Id: Iea061cb2bbf8cdd5eef06c4f5ebae38c2a24b42d
+Signed-off-by: Pintu Kumar <pintu.k@samsung.com>
+---
+ mm/memcontrol.c | 78 ++++++++++++++++++++++++++++++++++-----------------------
+ 1 file changed, 47 insertions(+), 31 deletions(-)
+
+diff --git a/mm/memcontrol.c b/mm/memcontrol.c
+index 4fe04b0..9868c92 100644
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -64,7 +64,9 @@
+ #include <linux/compaction.h>
+ #endif
+ #include <linux/vmstat.h>
++#include <linux/blkdev.h>
+ #define MIN_SHRINK_THRESHOLD 36000
++static DEFINE_MUTEX(shrink_lock);
+ #endif
+ 
+ #include <asm/uaccess.h>
+@@ -5016,37 +5018,22 @@ static int mem_cgroup_force_empty_write(struct cgroup *cont, unsigned int event)
+ 	return ret;
+ }
+ 
+-#ifdef CONFIG_MEMCG_SWAP
+-static int mem_cgroup_force_reclaim(struct cgroup *cont, struct cftype *cft, u64 val)
+-{
+-
+-	struct mem_cgroup *memcg = mem_cgroup_from_cont(cont);
+-	unsigned long nr_to_reclaim = val;
+-	unsigned long total = 0;
+-	int loop;
+ #ifdef CONFIG_SHRINK_MEMORY
+-	struct sysinfo sys_info;
++static void shrink_memory_handler(struct work_struct *work)
++{
+ 	unsigned long nr_reclaimable = 0;
+-#endif
+-
+-	for (loop = 0; loop < MEM_CGROUP_MAX_RECLAIM_LOOPS; loop++) {
+-		total += try_to_free_mem_cgroup_pages(memcg, GFP_KERNEL, false);
++	unsigned long nr_cached = 0;
++	unsigned long nr_shrink = 0;
+ 
+-		/*
+-		 * If nothing was reclaimed after two attempts, there
+-		 * may be no reclaimable pages in this hierarchy.
+-		 * If more than nr_to_reclaim pages were already reclaimed,
+-		 * finish force reclaim.
+-		 */
+-		if (loop && (!total || total > nr_to_reclaim))
+-			break;
++	if (!mutex_trylock(&shrink_lock)) {
++		pr_warn("%s: already in progrees: do nothing\n", __func__);
++		return;
+ 	}
+ 
+-#ifdef CONFIG_SHRINK_MEMORY
+-	si_meminfo(&sys_info);
+-
+-	nr_reclaimable = global_page_state(NR_FILE_PAGES) -
++	nr_cached = global_page_state(NR_FILE_PAGES) -
+ 			total_swapcache_pages();
++	nr_reclaimable = nr_cached + nr_blockdev_pages();
++
+ 	if (nr_reclaimable < 0)
+ 		nr_reclaimable = 0;
+ 
+@@ -5054,24 +5041,53 @@ static int mem_cgroup_force_reclaim(struct cgroup *cont, struct cftype *cft, u64
+ 	 * global reclaimable pages is more than MIN_SHRINK_THRESHOLD, then
+ 	 * call memory shrinker.
+ 	 */
+-	if ((total < 100) &&
+-		(nr_reclaimable > MIN_SHRINK_THRESHOLD)) {
+-		unsigned long nr_shrink;
++	if (nr_reclaimable > MIN_SHRINK_THRESHOLD) {
+ 		nr_shrink = shrink_all_memory(totalram_pages/2);
+ 		pr_info("%s: Total pages shrinked: %lu\n",
+ 					 __func__, nr_shrink);
+-		total += nr_shrink;
+ 	}
+ 
+ 	/* Calling compaction immediately after reclaim give good benefits.
+-	 * So, if either cgroup_reclaim or shrinker could make some progress,
++	 * So, if the shrinker could make some progress,
+ 	 * we trigger compaction.
+ 	 */
+ #ifdef CONFIG_COMPACTION
+-	if (total > 0)
++	if (nr_shrink > 0)
+ 		compact_nodes();
+ #endif
++	mutex_unlock(&shrink_lock);
++}
++static DECLARE_WORK(shrink_memory_work, shrink_memory_handler);
++#endif
++
++#ifdef CONFIG_MEMCG_SWAP
++static int mem_cgroup_force_reclaim(struct cgroup *cont, struct cftype *cft, u64 val)
++{
++
++	struct mem_cgroup *memcg = mem_cgroup_from_cont(cont);
++	unsigned long nr_to_reclaim = val;
++	unsigned long total = 0;
++	int loop;
++
++	for (loop = 0; loop < MEM_CGROUP_MAX_RECLAIM_LOOPS; loop++) {
++		total += try_to_free_mem_cgroup_pages(memcg, GFP_KERNEL, false);
++
++		/*
++		 * If nothing was reclaimed after two attempts, there
++		 * may be no reclaimable pages in this hierarchy.
++		 * If more than nr_to_reclaim pages were already reclaimed,
++		 * finish force reclaim.
++		 */
++		if (loop && (!total || total > nr_to_reclaim))
++			break;
++	}
++#ifdef CONFIG_SHRINK_MEMORY
++	if (total < 100) {
++		if (!work_pending(&shrink_memory_work))
++			schedule_work(&shrink_memory_work);
++	}
+ #endif
++
+ 	return total;
+ }
+ #endif
+-- 
+1.9.1
+

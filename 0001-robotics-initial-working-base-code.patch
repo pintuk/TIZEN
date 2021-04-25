@@ -1,0 +1,110 @@
+From f5dc502ce300159c3305e44044da8560fdd31579 Mon Sep 17 00:00:00 2001
+From: Pintu Kumar <pintu.k@samsung.com>
+Date: Mon, 10 Jul 2017 18:34:56 +0530
+Subject: [PATCH] [robotics]: initial working base code
+
+This is the initial working base code on raspberry pi2 with tizen 3.0.
+Below is some description and history about this work.
+Last year I have created a Tizen based robot using Tizen 3.0 common profile
+and raspberry pi2.
+I have given an Embedded Linux Conference talk about it:
+You can find the reference from here:
+http://events.linuxfoundation.org/sites/events/files/slides/ELC2016-TIZEN-RC-CAR.pdf
+
+At that time I noticed that there is no generic package or repo available
+in Tizen to communicate with the robot.
+When I say generic I mean, it should work in Tizen as well as any system
+having Linux running into it.
+
+So, then I thought to create my own robotic (headless) profile and contribute
+for Tizen.
+
+We created 2 repo here for different mode of communication.
+The current mode of communication is Bluetooth or Wi-Fi.
+It can be extended further in the similar ways.
+
+1) bt-robot-server:
+This is a server module (using systemd service model) for Raspberry pi
+based on HC 05 bluetooth module interface.
+This requires existing serial access to be disabled in the system.
+This can be extended to make it work with USB BT dongle using bluez.
+
+2) wifi-robot-server:
+This is a server module (using systemd service model) for Raspberry pi
+using normal linux based socket communication.
+To make this works, the connmanctl settings is required as described in ELC
+paper above.
+
+How it works:
+-------------
+Once installed, both these service daemon will be running as part of
+systemd boot-up service under multi-users.target.
+bt-robot will configure the serial port and just waits for the data to be
+received over serial port.
+wifi-robot will configure socket interface and waits for the connection
+and accept signal from the client.
+Once it receive the data, it sents the value to the respective peripheral
+using the GPIO interface.
+For this purpose we have developed a generic interface for GPIO.
+We also create separate thread for each purpose to server the multiple
+request.
+
+A separate Tizen application is developed using the Tizen 2.4 SDK.
+This will act as a client. This app will be contributed to Tizen App store
+once the server part is accepted.
+The app will send various commands to the server.
+C: This means : connect.
+When a char 'c' is sent the server will be connected to accept data.
+
+D: This means Disconnect.
+When 'd' is sent, the server will be disconnected and no more data
+will be accepted.
+
+F: This means Forward.
+When 'F' is received, the server will enable GPIO to move robot Forward.
+
+B: This means Back.
+When 'B' is received, the server will enable GPIO to move robot Back.
+
+L: This means Left.
+When 'L' is received, the server will enable GPIO to move robot Left.
+
+R: This means Right.
+When 'R' is received, the server will enable GPIO to move robot Right.
+
+S: This means Stop.
+When 'S' is received, the server will enable GPIO to stop the robot.
+
+This work is actually part of college intern project 2017 @ SRIB.
+Below were the 2 interns also involved to make this successful.
+1) Akshit K Gandhi : <akshitgandhi999@gmail.com>
+2) Vivek Jain : NIT Warangal, India
+
+We hope to contribute more after our initial work is accepted.
+
+Change-Id: I42776e9235dcf679fd211a68f6f80f91a6293340
+Signed-off-by: Pintu Kumar <pintu.k@samsung.com>
+---
+ bt-robot-server   | 1 +
+ wifi-robot-server | 1 +
+ 2 files changed, 2 insertions(+)
+ create mode 160000 bt-robot-server
+ create mode 160000 wifi-robot-server
+
+diff --git a/bt-robot-server b/bt-robot-server
+new file mode 160000
+index 0000000..f77a73b
+--- /dev/null
++++ b/bt-robot-server
+@@ -0,0 +1 @@
++Subproject commit f77a73ba27456e5dca9d96c8b65adf2af034eba5
+diff --git a/wifi-robot-server b/wifi-robot-server
+new file mode 160000
+index 0000000..f77a73b
+--- /dev/null
++++ b/wifi-robot-server
+@@ -0,0 +1 @@
++Subproject commit f77a73ba27456e5dca9d96c8b65adf2af034eba5
+-- 
+1.9.1
+

@@ -1,0 +1,89 @@
+From 234207c00620535bfae7fe89c5c2190aa229809b Mon Sep 17 00:00:00 2001
+From: Pintu Kumar <pintu.k@samsung.com>
+Date: Thu, 24 Sep 2015 10:24:45 +0530
+Subject: [PATCH] mm: vmstat: Add OOM kill count in vmstat counter
+
+This patch maintains number of oom calls and number of oom kill
+count in /proc/vmstat.
+It is helpful during sluggish, aging or long duration tests.
+Currently if the OOM happens, it can be only seen in kernel ring buffer.
+But during long duration tests, all the dmesg and /var/log/messages* could
+be overwritten.
+So, just like other counters, the oom can also be mainted in /proc/vmstat.
+It can be also seen if all logs are disabled in kernel.
+A snapshot of the result of over night test is shown below:
+$ cat /proc/vmstat
+oom_stall 610
+oom_kill_count 1763
+
+Here, oom_stall indicates that there are 610 times, kernel entered into OOM
+cases. However, there were around 1763 oom killing happens.
+
+Change-Id: I316f8d86061ea2cc9fd3f993436bbe0984e1deee
+Signed-off-by: Pintu Kumar <pintu.k@samsung.com>
+---
+ include/linux/vm_event_item.h | 2 ++
+ mm/oom_kill.c                 | 2 ++
+ mm/page_alloc.c               | 1 +
+ mm/vmstat.c                   | 2 ++
+ 4 files changed, 7 insertions(+)
+
+diff --git a/include/linux/vm_event_item.h b/include/linux/vm_event_item.h
+index 68412c3..4e3809b 100644
+--- a/include/linux/vm_event_item.h
++++ b/include/linux/vm_event_item.h
+@@ -54,6 +54,8 @@ enum vm_event_item { PGPGIN, PGPGOUT, PSWPIN, PSWPOUT,
+ #ifdef CONFIG_HUGETLB_PAGE
+ 		HTLB_BUDDY_PGALLOC, HTLB_BUDDY_PGALLOC_FAIL,
+ #endif
++		OOM_STALL,
++		OOM_KILL_COUNT,
+ 		UNEVICTABLE_PGCULLED,	/* culled to noreclaim list */
+ 		UNEVICTABLE_PGSCANNED,	/* scanned for reclaimability */
+ 		UNEVICTABLE_PGRESCUED,	/* rescued from noreclaim list */
+diff --git a/mm/oom_kill.c b/mm/oom_kill.c
+index 13cc6c0..bd5a6e7 100644
+--- a/mm/oom_kill.c
++++ b/mm/oom_kill.c
+@@ -552,11 +552,13 @@ void oom_kill_process(struct task_struct *p, gfp_t gfp_mask, int order,
+ 				task_pid_nr(p), p->comm);
+ 			task_unlock(p);
+ 			do_send_sig_info(SIGKILL, SEND_SIG_FORCED, p, true);
++			count_vm_event(OOM_KILL_COUNT);
+ 		}
+ 	rcu_read_unlock();
+ 
+ 	set_thread_group_flag(victim, TIF_MEMDIE);
+ 	do_send_sig_info(SIGKILL, SEND_SIG_FORCED, victim, true);
++	count_vm_event(OOM_KILL_COUNT);
+ 	put_task_struct(victim);
+ }
+ #undef K
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index f71c010..50a5960 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -2230,6 +2230,7 @@ __alloc_pages_may_oom(gfp_t gfp_mask, unsigned int order,
+ 	 * See freeze_processes.
+ 	 */
+ 	note_oom_kill();
++	count_vm_event(OOM_STALL);
+ 
+ 	/*
+ 	 * Go through the zonelist yet one more time, keep very high watermark
+diff --git a/mm/vmstat.c b/mm/vmstat.c
+index 66d8941..aab24bb 100644
+--- a/mm/vmstat.c
++++ b/mm/vmstat.c
+@@ -821,6 +821,8 @@ const char * const vmstat_text[] = {
+ 	"compact_fail",
+ 	"compact_success",
+ #endif
++	"oom_stall",
++	"oom_kill_count",
+ 
+ #ifdef CONFIG_HUGETLB_PAGE
+ 	"htlb_buddy_alloc_success",
+-- 
+1.9.1
+

@@ -1,0 +1,2 @@
+> make distclean ; make clean ; make sp6821a_config ; make ; make fdl2
+

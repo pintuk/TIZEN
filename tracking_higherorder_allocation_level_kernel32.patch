@@ -1,0 +1,167 @@
+diff -purN OLD/page_alloc.c NEW/page_alloc.c
+--- OLD/page_alloc.c	2011-08-26 11:32:46.945139177 +0530
++++ NEW/page_alloc.c	2011-08-26 11:54:57.421141328 +0530
+@@ -58,6 +58,11 @@
+ #include <asm/div64.h>
+ #include "internal.h"
+ 
++
++/* Used for Tracking Higher-order allocation API */
++#include<linux/delay.h>  /* Required for ssleep() */
++extern int measure_fragmentation_level(struct zone *zone, int order); /* Definition is in mm/vmstat.c */
++
+ /*
+  * Array of node states.
+  */
+@@ -1787,6 +1792,26 @@ gfp_to_alloc_flags(gfp_t gfp_mask)
+ 	return alloc_flags;
+ }
+ 
++
++/* Tracking higher-order allocation */
++static inline int check_higherorder_allocation_level(struct zone *zone, int order, int nid)
++{
++	int fraglevel=0;
++
++        if(order > PAGE_ALLOC_COSTLY_ORDER)  /* In kernel it is found that order greater than PAGE_ALLOC_COSTLY_ORDER(=3) is treated as higher-orders */
++        {
++		struct task_struct *p = current;
++		unsigned long flags=0;
++                printk("[HIGHERORDER_DEBUG] : __alloc_pages_nodemask is called by process <PID = %d, NAME = %s> !!!\n",p->pid,p->comm);
++		spin_lock_irqsave(&zone->lock, flags);
++                fraglevel = measure_fragmentation_level(zone, order);
++		spin_unlock_irqrestore(&zone->lock, flags);
++                printk("[HIGHERORDER_DEBUG] : ZONE : %s, NODE : %d, ORDER = %d, Fragmentation Level = %d%%\n",zone->name, nid, order, fraglevel);
++        }
++	return(fraglevel);
++	
++}
++
+ static inline struct page *
+ __alloc_pages_slowpath(gfp_t gfp_mask, unsigned int order,
+ 	struct zonelist *zonelist, enum zone_type high_zoneidx,
+@@ -1912,8 +1937,24 @@ nopage:
+ 		printk(KERN_WARNING "%s: page allocation failure."
+ 			" order:%d, mode:0x%x\n",
+ 			p->comm, order, gfp_mask);
+-		dump_stack();
+-		show_mem();
++		/* Earlier dump stack was call here bofore returning failure */
++		//dump_stack();
++		show_mem();  /* show_mem actually reclaims free pages from caches */
++		/* This sleep of 2 second is important here otherwise trying allocation will never work */
++		/* This is because, after free pages are released from caches, the free pages need to be added in the free_area according to the order */
++		/* The buddy allocator is implemented as _lazy_ buddy allocation algorithm which takes some time to prepare free area list */
++		/* Thus as per the experiements we need to wait atleast 2 seconds for the free page to be available in free_area list */
++		ssleep(2);
++		printk("[HIGHERORDER_DEBUG] : Trying - Final time !!!!!!!!!!!\n");
++		page = get_page_from_freelist(gfp_mask, nodemask, order, zonelist,
++			high_zoneidx, alloc_flags & ~ALLOC_NO_WATERMARKS,
++			preferred_zone, migratetype);
++		if(page) {
++			goto got_pg;
++		} else {
++			dump_stack();
++			show_mem();
++		}
+ 	}
+ 	return page;
+ got_pg:
+@@ -1934,6 +1975,8 @@ __alloc_pages_nodemask(gfp_t gfp_mask, u
+ 	struct zone *preferred_zone;
+ 	struct page *page;
+ 	int migratetype = allocflags_to_migratetype(gfp_mask);
++	int nid = 0;
++	int fraglevel = 0;
+ 
+ 	gfp_mask &= gfp_allowed_mask;
+ 
+@@ -1961,14 +2004,34 @@ __alloc_pages_nodemask(gfp_t gfp_mask, u
+ 	memnotify_threshold(gfp_mask);
+ #endif
+ 
++	/* If there are more than 1 Node in each zone, we need to check the level for all the Nodes */
++        /* Because if one Node is full, the allocation may happen from next Node */
++	/* Thus checking fragmentation level for all the Nodes is important */
++	for_each_online_node(nid) {
++		int idx = zone_idx(preferred_zone);
++		struct zone *zone = &(NODE_DATA(nid)->node_zones[idx]);
++		fraglevel = check_higherorder_allocation_level(zone, order, nid);
++	}
++
++	/* Decision needs to be taken here about what needs to be done if fragmentation level for */
++	/* higher-order alocation is very high. */
++	/* Whether we should return nopage to the user process or some critical message to the user space application ??? */
++	/* Note that OOM killer will not be invoked for higher-order allocation */
++	/* Also it is observed that if fragmentation level is atmost 98% then allocation goes through slowpath and becomes more critical */
++
++
+ 	/* First allocation attempt */
+ 	page = get_page_from_freelist(gfp_mask|__GFP_HARDWALL, nodemask, order,
+ 			zonelist, high_zoneidx, ALLOC_WMARK_LOW|ALLOC_CPUSET,
+ 			preferred_zone, migratetype);
+ 	if (unlikely(!page))
++	{
++		if(order > PAGE_ALLOC_COSTLY_ORDER)
++			printk("[HIGHERORDER_DEBUG] : __alloc_pages_nodemask : Allocation going via - slowpath !!!\n");
+ 		page = __alloc_pages_slowpath(gfp_mask, order,
+ 				zonelist, high_zoneidx, nodemask,
+ 				preferred_zone, migratetype);
++	}
+ 
+ 	trace_mm_page_alloc(page, order, gfp_mask, migratetype);
+ 	return page;
+@@ -1987,6 +2050,7 @@ unsigned long __get_free_pages(gfp_t gfp
+ 	 * a highmem page
+ 	 */
+ 	VM_BUG_ON((gfp_mask & __GFP_HIGHMEM) != 0);
++	
+ 
+ 	page = alloc_pages(gfp_mask, order);
+ 	if (!page)
+diff -purN OLD/vmstat.c NEW/vmstat.c
+--- OLD/vmstat.c	2011-08-26 11:32:20.369141610 +0530
++++ NEW/vmstat.c	2011-08-26 11:54:43.858141450 +0530
+@@ -619,8 +619,9 @@ static const struct file_operations page
+  * order => represents the page order
+  * RETURN Value = the rounding off fragmentation level in percentage across each order
+ */
+-static int measure_fragmentation_level(struct zone *zone, unsigned long totalfreepages, int order)
++int measure_fragmentation_level(struct zone *zone, int order)
+ {
++	unsigned long totalfreepages = 0;
+         unsigned long nr_freepages = 0; /* number of free pages in each order*/
+         unsigned long highorderpages = 0; /* number of free pages from the desired order value */
+         int level = 0; /* percentage fragmentation level */
+@@ -628,14 +629,22 @@ static int measure_fragmentation_level(s
+ 
+ 	if(zone == NULL) return 0;
+ 
++	totalfreepages = zone_page_state(zone, NR_FREE_PAGES);
++	if(totalfreepages <= 0) {
++		return(0);
++	}
++	nr_freepages = 0;
+         for(o=order; o<MAX_ORDER; o++) {
+                 nr_freepages = zone->free_area[o].nr_free;
+                 highorderpages += (1 << o)*nr_freepages;
+         }
+         level = ((totalfreepages - highorderpages)*100)/totalfreepages;
++	if(level <=0 || level > 100)
++		level = 0;
+ 
+         return level;
+ }
++EXPORT_SYMBOL(measure_fragmentation_level);
+ 
+ /* The purpose of this API is to calculate total number of pages in each migrate type in each zone
+  * based on the order.
+@@ -689,7 +698,7 @@ static void fraglevelinfo_show_print(str
+         seq_printf(m, "Order\t FreePages\t MovablePages\t ReclaimablePages\t Fragmentation[%%] \n");
+         for (order = 0; order < MAX_ORDER; order++) {
+                 freepages = zone->free_area[order].nr_free;
+-                fraglevel = measure_fragmentation_level(zone,totalfreepages,order);
++                fraglevel = measure_fragmentation_level(zone,order);
+ 		avglevel = avglevel + fraglevel;
+                 movablepages = get_migratetype_pages(zone,order,MIGRATE_MOVABLE);
+                 totalmovablepages += (1 << order)*movablepages;

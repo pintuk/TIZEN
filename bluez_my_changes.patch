@@ -1,0 +1,27 @@
+diff --git a/configure.ac b/configure.ac
+index ed1dc3f..d52dc16 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -264,6 +264,10 @@ AC_ARG_ENABLE(sap, AC_HELP_STRING([--enable-sap],
+ 			[Enable SAP Plugin]), [enable_sap=${enableval}])
+ AM_CONDITIONAL(TIZEN_SAP_PLUGIN, test "${enable_sap}" = "yes")
+ 
++AC_ARG_ENABLE(sap, AC_HELP_STRING([--enable-client],
++			[Enable CLIENT Plugin]), [enable_client=${enableval}])
++AM_CONDITIONAL(TIZEN_CLIENT_PLUGIN, test "${enable_client}" = "yes")
++
+ # End of __TIZEN_PATCH__
+ 
+ AC_ARG_ENABLE(sixaxis, AC_HELP_STRING([--enable-sixaxis],
+diff --git a/packaging/bluez.spec b/packaging/bluez.spec
+index c6bae38..3ccc89a 100644
+--- a/packaging/bluez.spec
++++ b/packaging/bluez.spec
+@@ -184,6 +184,7 @@ export CFLAGS+=" -DPBAP_SIM_ENABLE"
+ %if 0%{?sec_product_feature_bt_sap_enable}
+ 			--enable-sap \
+ %endif
++			--enable-client \
+ 			--enable-tizenunusedplugin=no
+ 
+ make %{?jobs:-j%jobs}

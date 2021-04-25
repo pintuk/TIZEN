@@ -1,0 +1,371 @@
+From b0d595c2e087e083b7f1404ffdc0d84cf6421082 Mon Sep 17 00:00:00 2001
+From: "vishnu.ps" <vishnu.ps@samsung.com>
+Date: Tue, 24 Dec 2013 18:06:57 +0530
+Subject: [PATCH] kmalloc accounting
+
+Change-Id: Ic5a7888f19c7c83a19b43a227d57631d388e38f0
+Signed-off-by: vishnu.ps <vishnu.ps@samsung.com>
+---
+ arch/arm/configs/mint-vlx-rev03_defconfig |   3 +-
+ include/linux/slub_def.h                  |  24 +++-
+ init/Kconfig                              |   8 ++
+ mm/Makefile                               |   1 +
+ mm/kmallocacct.c                          | 184 ++++++++++++++++++++++++++++++
+ mm/slub.c                                 |   3 +-
+ mm/vmstat.c                               |  22 ++++
+ 7 files changed, 242 insertions(+), 3 deletions(-)
+ create mode 100644 mm/kmallocacct.c
+
+diff --git a/arch/arm/configs/mint-vlx-rev03_defconfig b/arch/arm/configs/mint-vlx-rev03_defconfig
+index 307024b..c5d969b 100755
+--- a/arch/arm/configs/mint-vlx-rev03_defconfig
++++ b/arch/arm/configs/mint-vlx-rev03_defconfig
+@@ -142,7 +142,8 @@ CONFIG_PERF_EVENTS=y
+ CONFIG_VM_EVENT_COUNTERS=y
+ CONFIG_COMPAT_BRK=y
+ CONFIG_SLAB=y
+-# CONFIG_SLUB is not set
++CONFIG_SLUB=y
++CONFIG_KMALLOC_ACCOUNTING=y
+ # CONFIG_SLOB is not set
+ # CONFIG_PROFILING is not set
+ # CONFIG_KPROBES is not set
+diff --git a/include/linux/slub_def.h b/include/linux/slub_def.h
+index c8668d1..df875c7 100644
+--- a/include/linux/slub_def.h
++++ b/include/linux/slub_def.h
+@@ -143,6 +143,23 @@ struct kmem_cache {
+ #define SLUB_DMA (__force gfp_t)0
+ #endif
+ 
++#ifdef CONFIG_KMALLOC_ACCOUNTING
++void __kmalloc_account(const void *, const void *, int, int);
++
++static void inline kmalloc_account(const void *addr, int size, int req)
++{
++       __kmalloc_account(__builtin_return_address(0), addr, size, req);
++}
++
++static void inline kfree_account(const void *addr, int size)
++{
++       __kmalloc_account(__builtin_return_address(0), addr, size, -1);
++}
++#else
++#define kmalloc_account(a, b, c)
++#define kfree_account(a, b)
++#endif
++
+ /*
+  * We keep the general caches in an array of slab caches that are used for
+  * 2^x bytes of allocations.
+@@ -248,12 +265,16 @@ kmalloc_order_trace(size_t size, gfp_t flags, unsigned int order)
+ 
+ static __always_inline void *kmalloc_large(size_t size, gfp_t flags)
+ {
++	void *ret;
+ 	unsigned int order = get_order(size);
+-	return kmalloc_order_trace(size, flags, order);
++	ret = kmalloc_order_trace(size, flags, order);
++	kmalloc_account(ret, size, size);
++	return ret;
+ }
+ 
+ static __always_inline void *kmalloc(size_t size, gfp_t flags)
+ {
++#ifndef CONFIG_KMALLOC_ACCOUNTING
+ 	if (__builtin_constant_p(size)) {
+ 		if (size > SLUB_MAX_SIZE)
+ 			return kmalloc_large(size, flags);
+@@ -267,6 +288,7 @@ static __always_inline void *kmalloc(size_t size, gfp_t flags)
+ 			return kmem_cache_alloc_trace(s, flags, size);
+ 		}
+ 	}
++#endif
+ 	return __kmalloc(size, flags);
+ }
+ 
+diff --git a/init/Kconfig b/init/Kconfig
+index ad0a30f..f28d649 100644
+--- a/init/Kconfig
++++ b/init/Kconfig
+@@ -1039,6 +1039,14 @@ config PCSPKR_PLATFORM
+           This option allows to disable the internal PC-Speaker
+           support, saving some memory.
+ 
++config KMALLOC_ACCOUNTING
++       default n
++       bool "Enabled accounting of kmalloc/kfree allocations" if EMBEDDED
++       help
++         This option records kmalloc and kfree activity and reports it via
++         /proc/kmalloc.
++
++
+ config BASE_FULL
+ 	default y
+ 	bool "Enable full-sized data structures for core" if EXPERT
+diff --git a/mm/Makefile b/mm/Makefile
+index 70e47dc..43cae0d 100644
+--- a/mm/Makefile
++++ b/mm/Makefile
+@@ -24,6 +24,7 @@ endif
+ obj-$(CONFIG_HAVE_MEMBLOCK) += memblock.o
+ 
+ obj-$(CONFIG_BOUNCE)	+= bounce.o
++obj-$(CONFIG_KMALLOC_ACCOUNTING) += kmallocacct.o
+ obj-$(CONFIG_SWAP)	+= page_io.o swap_state.o swapfile.o thrash.o
+ obj-$(CONFIG_HAS_DMA)	+= dmapool.o
+ obj-$(CONFIG_HUGETLBFS)	+= hugetlb.o
+diff --git a/mm/kmallocacct.c b/mm/kmallocacct.c
+new file mode 100644
+index 0000000..3a65bb7
+--- /dev/null
++++ b/mm/kmallocacct.c
+@@ -0,0 +1,184 @@
++//#include       <linux/Kconfig.h>
++#include       <linux/seq_file.h>
++#include       <linux/kallsyms.h>
++#include       <linux/spinlock.h>
++
++struct kma_caller {
++       const void *caller;
++       long int total, net, slack, allocs, frees;
++};
++
++struct kma_list {
++       int callerhash;
++       const void *address;
++};
++
++#define MAX_CALLER_TABLE 512
++#define MAX_ALLOC_TRACK 2048
++
++#define kma_hash(address, size) (((u32)address / (u32)size) % size)
++
++static struct kma_list kma_alloc[MAX_ALLOC_TRACK];
++static struct kma_caller kma_caller[MAX_CALLER_TABLE];
++
++static int kma_callers;
++static int kma_lost_callers, kma_lost_allocs, kma_unknown_frees;
++static long int kma_total, kma_net, kma_slack, kma_allocs, kma_frees;
++static DEFINE_SPINLOCK(kma_lock);
++
++void __kmalloc_account(const void *caller, const void *addr, int size, int req)
++{
++       int i, hasha, hashc;
++       unsigned long flags;
++
++       spin_lock_irqsave(&kma_lock, flags);
++       if(req >= 0) /* kmalloc */
++       {
++               /* find callers slot */
++               hashc = kma_hash(caller, MAX_CALLER_TABLE);
++               for (i = 0; i < MAX_CALLER_TABLE; i++) {
++                       if (!kma_caller[hashc].caller ||
++                           kma_caller[hashc].caller == caller)
++                               break;
++                       hashc = (hashc + 1) % MAX_CALLER_TABLE;
++               }
++
++               if (!kma_caller[hashc].caller)
++                       kma_callers++;
++
++               if (i < MAX_CALLER_TABLE) {
++                       /* update callers stats */
++                       kma_caller[hashc].caller = caller;
++                       kma_caller[hashc].total += size;
++                       kma_caller[hashc].net += size;
++                       kma_caller[hashc].slack += size - req;
++                       kma_caller[hashc].allocs++;
++
++                       /* add malloc to list */
++                       hasha = kma_hash(addr, MAX_ALLOC_TRACK);
++                       for (i = 0; i < MAX_ALLOC_TRACK; i++) {
++                               if (!kma_alloc[hasha].callerhash)
++                                       break;
++                               hasha = (hasha + 1) % MAX_ALLOC_TRACK;
++                       }
++
++                       if(i < MAX_ALLOC_TRACK) {
++                               kma_alloc[hasha].callerhash = hashc;
++                               kma_alloc[hasha].address = addr;
++                       }
++                       else
++                               kma_lost_allocs++;
++               }
++               else {
++                       kma_lost_callers++;
++                       kma_lost_allocs++;
++               }
++
++               kma_total += size;
++               kma_net += size;
++               kma_slack += size - req;
++               kma_allocs++;
++       }
++       else { /* kfree */
++               hasha = kma_hash(addr, MAX_ALLOC_TRACK);
++               for (i = 0; i < MAX_ALLOC_TRACK ; i++) {
++                       if (kma_alloc[hasha].address == addr)
++                               break;
++                       hasha = (hasha + 1) % MAX_ALLOC_TRACK;
++               }
++
++               if (i < MAX_ALLOC_TRACK) {
++                       hashc = kma_alloc[hasha].callerhash;
++                       kma_alloc[hasha].callerhash = 0;
++                       kma_caller[hashc].net -= size;
++                       kma_caller[hashc].frees++;
++               }
++               else
++                       kma_unknown_frees++;
++
++               kma_net -= size;
++               kma_frees++;
++       }
++       spin_unlock_irqrestore(&kma_lock, flags);
++}
++
++static void *as_start(struct seq_file *m, loff_t *pos)
++{
++       int i;
++       loff_t n = *pos;
++
++       if (!n) {
++               seq_printf(m, "total bytes allocated: %16ld\n", kma_total);
++               seq_printf(m, "slack bytes allocated: %16ld\n", kma_slack);
++               seq_printf(m, "net bytes allocated:   %16ld\n", kma_net);
++               seq_printf(m, "number of allocs:      %16ld\n", kma_allocs);
++               seq_printf(m, "number of frees:       %16ld\n", kma_frees);
++               seq_printf(m, "number of callers:     %8d\n", kma_callers);
++               seq_printf(m, "lost callers:          %8d\n",
++                          kma_lost_callers);
++               seq_printf(m, "lost allocs:           %8d\n",
++                          kma_lost_allocs);
++               seq_printf(m, "unknown frees:         %8d\n",
++                          kma_unknown_frees);
++               seq_puts(m, "\n           total           slack            net      count-alloc/free        caller\n");
++       }
++
++       for (i = 0; i < MAX_CALLER_TABLE; i++) {
++               if(kma_caller[i].caller)
++                       n--;
++               if(n < 0)
++                       return (void *)(i+1);
++       }
++
++       return 0;
++}
++
++
++static void *as_next(struct seq_file *m, void *p, loff_t *pos)
++{
++       int n = (int)p-1, i;
++       ++*pos;
++
++       for (i = n + 1; i < MAX_CALLER_TABLE; i++)
++               if(kma_caller[i].caller)
++                       return (void *)(i+1);
++
++       return 0;
++}
++
++static void as_stop(struct seq_file *m, void *p)
++{
++}
++
++static int as_show(struct seq_file *m, void *p)
++{
++       int n = (int)p-1;
++       struct kma_caller *c;
++#ifdef CONFIG_KALLSYMS
++       char *modname;
++       const char *name;
++       unsigned long offset = 0, size;
++       char namebuf[128];
++
++       c = &kma_caller[n];
++       name = kallsyms_lookup((int)c->caller, &size, &offset, &modname,
++                              namebuf);
++       seq_printf(m, "%16ld %16ld %16ld %10ld/%-10ld %s+0x%lx\n",
++                  c->total, c->slack, c->net, c->allocs, c->frees,
++                  name, offset);
++#else
++       c = &kma_caller[n];
++       seq_printf(m, "%16ld %16ld %16ld %5d/%-5d %p\n",
++                  c->total, c->slack, c->net, c->allocs, c->frees, c->caller);
++#endif
++
++       return 0;
++}
++
++struct seq_operations kmalloc_account_op = {
++       .start  = as_start,
++       .next   = as_next,
++       .stop   = as_stop,
++       .show   = as_show,
++};
++
+diff --git a/mm/slub.c b/mm/slub.c
+index 35f351f..43816cf 100644
+--- a/mm/slub.c
++++ b/mm/slub.c
+@@ -2861,7 +2861,7 @@ void *__kmalloc(size_t size, gfp_t flags)
+ 	ret = slab_alloc(s, flags, NUMA_NO_NODE, _RET_IP_);
+ 
+ 	trace_kmalloc(_RET_IP_, ret, size, s->size, flags);
+-
++	kmalloc_account(ret, s->size, size);
+ 	return ret;
+ }
+ EXPORT_SYMBOL(__kmalloc);
+@@ -2933,6 +2933,7 @@ void kfree(const void *x)
+ 	struct page *page;
+ 	void *object = (void *)x;
+ 
++	kfree_account(object, ksize(object));
+ 	trace_kfree(_RET_IP_, x);
+ 
+ 	if (unlikely(ZERO_OR_NULL_PTR(x)))
+diff --git a/mm/vmstat.c b/mm/vmstat.c
+index ad1c213..dc458fa 100644
+--- a/mm/vmstat.c
++++ b/mm/vmstat.c
+@@ -1138,6 +1138,25 @@ static const struct file_operations proc_vmstat_file_operations = {
+ };
+ #endif /* CONFIG_PROC_FS */
+ 
++#ifdef CONFIG_KMALLOC_ACCOUNTING
++
++extern struct seq_operations kmalloc_account_op;
++
++
++static int kmalloc_account_open(struct inode *inode, struct file *file)
++{
++       return seq_open(file, &kmalloc_account_op);
++}
++
++static const struct file_operations proc_kmalloc_account_operations = {
++        .open           = kmalloc_account_open,
++        .read           = seq_read,
++        .llseek         = seq_lseek,
++        .release        = seq_release,
++};
++#endif
++
++
+ #ifdef CONFIG_SMP
+ static DEFINE_PER_CPU(struct delayed_work, vmstat_work);
+ int sysctl_stat_interval __read_mostly = HZ;
+@@ -1213,6 +1232,9 @@ static int __init setup_vmstat(void)
+ 	proc_create("vmstat", S_IRUGO, NULL, &proc_vmstat_file_operations);
+ 	proc_create("zoneinfo", S_IRUGO, NULL, &proc_zoneinfo_file_operations);
+ #endif
++#ifdef CONFIG_KMALLOC_ACCOUNTING
++       proc_create("kmalloc", S_IRUGO, NULL, &proc_kmalloc_account_operations);
++#endif
+ 	return 0;
+ }
+ module_init(setup_vmstat)
+-- 
+1.8.3.2
+

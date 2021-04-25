@@ -1,0 +1,5 @@
+username: pintu
+password: pania007
+
+git clone ssh://pintu@review.tizen.org:29418/framework/api/bluetooth
+
